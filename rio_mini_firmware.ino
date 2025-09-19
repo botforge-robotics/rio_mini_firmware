@@ -66,6 +66,19 @@ float scale_motor_pwm = 1.0; // Default to full scale
 // ToF sensor last valid reading
 float last_valid_distance = 0.0; // Last valid distance reading in meters
 
+// Connection state management
+enum ConnectionState
+{
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_DISCONNECTED
+};
+ConnectionState connection_state = WAITING_AGENT;
+
+// Connection parameters
+const int ping_timeout_ms = 100; // Timeout for agent ping in milliseconds
+const uint8_t ping_attempts = 1; // Number of ping attempts
+
 // Time synchronization status
 bool time_sync_status = false;
 
@@ -93,6 +106,16 @@ Adafruit_NeoPixel pixels(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 #define SERVO_PIN 17 // ESP32 GPIO17 for servo control
 Servo servo;
 
+// Servo smooth movement variables
+const unsigned long SERVO_MOVEMENT_DURATION_MS = 1500; // Time to reach target position (ms)
+const int SERVO_MIN_ANGLE = 110;                       // Minimum servo angle (degrees)
+const int SERVO_MAX_ANGLE = 180;                       // Maximum servo angle (degrees)
+int servo_current_position = 180;                      // Current servo position
+int servo_target_position = 180;                       // Target position for servo
+unsigned long servo_movement_start_time = 0;           // When the movement started
+bool servo_is_moving = false;                          // Flag to track if servo is in motion
+TaskHandle_t servoTaskHandle = NULL;                   // Task handle for servo movement
+
 // Function declarations
 void setupMotors();
 void setLeftMotor(int power);
@@ -116,10 +139,13 @@ void pwm_scale_callback(const void *msgin);
 void setupROS();
 void publishToFData();
 bool synchronize_time();
+void create_entities();
+void destroy_entities();
 
 // FreeRTOS Task functions
 void mainTask(void *pvParameters);
 void tofTask(void *pvParameters);
+void servoTask(void *pvParameters);
 
 // Error handling macros
 #define RCCHECK(fn)              \
@@ -150,10 +176,13 @@ void pwm_scale_callback(const void *msgin);
 void setupROS();
 void publishToFData();
 bool synchronize_time();
+void create_entities();
+void destroy_entities();
 
 // FreeRTOS Task functions
 void mainTask(void *pvParameters);
 void tofTask(void *pvParameters);
+void servoTask(void *pvParameters);
 
 // Error handling macros
 #define RCCHECK(fn)              \
@@ -186,11 +215,7 @@ void setup()
   setupNeoPixel();
   setupServo();
 
-  // Initialize ROS
-  setupROS();
-
-  // Serial.println("Setup complete. Starting main loop...");
-  // Initialize ROS
+  // Initialize ROS transport only (entities will be created when agent is available)
   setupROS();
 
   // Serial.println("Setup complete. Starting main loop...");
@@ -425,19 +450,56 @@ void setupServo()
   ESP32PWM::allocateTimer(3);
   servo.setPeriodHertz(50);
   servo.attach(SERVO_PIN, 1000, 2500);
-  setServoAngle(180); // Set servo to center position (90 degrees)
+  setServoAngle(SERVO_MAX_ANGLE); // Set servo to maximum position (180 degrees)
 }
 
-// Set servo angle (0-180 degrees)
+// Set servo angle (110-180 degrees) with smooth movement
 void setServoAngle(int angle)
 {
-  // Constrain angle to valid range
-  angle = constrain(angle, 0, 180);
+  // Constrain angle to valid range (110-180 degrees)
+  angle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
 
-  servo.write(angle);
-  // Serial.print("Servo angle set to: ");
-  // Serial.print(angle);
-  // Serial.println(" degrees");
+  // Only update if target position is different
+  if (angle != servo_target_position)
+  {
+    servo_target_position = angle;
+
+    // If not already moving, save current position and start movement
+    if (!servo_is_moving)
+    {
+      // Fix initial position reading - servo.read() returns 0 initially
+      // Use the last known position or default to center of range
+      if (servo_current_position == 180 && servo.read() == 0)
+      {
+        servo_current_position = SERVO_MAX_ANGLE; // Start from max position
+        servo.write(servo_current_position);      // Set initial position
+        delay(100);                               // Small delay to let servo reach position
+      }
+      else
+      {
+        servo_current_position = servo.read();
+        // Ensure current position is within valid range
+        servo_current_position = constrain(servo_current_position, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+      }
+
+      servo_movement_start_time = millis();
+      servo_is_moving = true;
+
+      // Serial.print("Starting servo movement from ");
+      // Serial.print(servo_current_position);
+      // Serial.print(" to ");
+      // Serial.println(servo_target_position);
+    }
+    else
+    {
+      // Already moving, update target and restart timing
+      // This preserves smooth motion even if target changes during movement
+      servo_movement_start_time = millis();
+
+      // Serial.print("Updating servo target to ");
+      // Serial.println(servo_target_position);
+    }
+  }
 }
 
 /*==========================================
@@ -454,62 +516,11 @@ void setupROS()
 
   allocator = rcl_get_default_allocator();
 
-  // Create init_options
-  // Serial.println("Initializing ROS support...");
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-
-  // Create node
-  // Serial.println("Creating ROS node...");
-  RCCHECK(rclc_node_init_default(&node, "rio_mini", "", &support));
-
-  // Create subscriptions
-  // Serial.println("Creating subscriptions...");
-
-  // Serial.println("Creating cmd_vel subscription...");
-  RCCHECK(rclc_subscription_init_default(
-      &cmd_vel_sub,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistStamped),
-      "cmd_vel"));
-
-  // Serial.println("Creating head_pitch subscription...");
-  RCCHECK(rclc_subscription_init_default(
-      &head_pitch_sub,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-      "head_pitch"));
-
-  // Serial.println("Creating led subscription...");
-  RCCHECK(rclc_subscription_init_default(
-      &led_sub,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, ColorRGBA),
-      "led"));
-
-  // Serial.println("Creating pwm_scale subscription...");
-  RCCHECK(rclc_subscription_init_default(
-      &pwm_scale_sub,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-      "pwm_scale"));
-
-  // Create publisher
-  // Serial.println("Creating publisher...");
-  RCCHECK(rclc_publisher_init_best_effort(
-      &tof_pub,
-      &node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Range),
-      "tof"));
-
-  // Serial.println("Initializing executor...");
-  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
-
-  // Add subscriptions to executor
-  // Serial.println("Adding subscriptions to executor...");
-  RCCHECK(rclc_executor_add_subscription(&executor, &cmd_vel_sub, &twist_msg, &cmd_vel_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_subscription(&executor, &head_pitch_sub, &head_pitch_msg, &head_pitch_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_subscription(&executor, &led_sub, &led_msg, &led_callback, ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_subscription(&executor, &pwm_scale_sub, &pwm_scale_msg, &pwm_scale_callback, ON_NEW_DATA));
+  // Initialize ToF message memory - it's needed regardless of connection
+  rosidl_runtime_c__String__init(&tof_msg.header.frame_id);
+  rosidl_runtime_c__String__assign(&tof_msg.header.frame_id, "tof_link");
+  tof_msg.min_range = 0.03; // 3cm minimum range
+  tof_msg.max_range = 2.0;  // 2m maximum range
 
   // Create FreeRTOS tasks
   // Serial.println("Creating FreeRTOS tasks...");
@@ -548,23 +559,24 @@ void setupROS()
     return;
   }
 
-  // Initialize ToF message
-  rosidl_runtime_c__String__init(&tof_msg.header.frame_id);
-  rosidl_runtime_c__String__assign(&tof_msg.header.frame_id, "tof_link");
-  tof_msg.min_range = 0.03; // 3cm minimum range
-  tof_msg.max_range = 2.0;  // 2m maximum range
+  // Create servo movement task on core 0 (dedicated servo core)
+  BaseType_t servoTaskResult = xTaskCreatePinnedToCore(
+      servoTask,        // Task function
+      "Servo Task",     // Name of the task
+      2048,             // Stack size
+      NULL,             // Task input parameter
+      3,                // Higher priority than TOF task
+      &servoTaskHandle, // Task handle
+      0                 // Core 0 - dedicated servo movement
+  );
 
-  // Synchronize time
-  // Serial.println("Synchronizing time...");
-  if (!synchronize_time())
+  if (servoTaskResult != pdPASS)
   {
-    // Serial.println("Time sync failed!");
+    // Serial.println("ERROR: Failed to create Servo task!");
+    return;
   }
 
-  // Initialize memory management
-  // Serial.println("Initializing memory management...");
-
-  // Serial.println("ROS setup complete - All systems ready!");
+  // Serial.println("ROS transport setup complete. Waiting for agent connection...");
 }
 
 // Callback for cmd_vel topic - controls differential drive
@@ -726,13 +738,16 @@ void publishToFData()
   tof_msg.header.stamp.nanosec = tv.tv_nsec;
   tof_msg.header.stamp.sec = tv.tv_sec;
 
-  // Publish with error handling
-  rcl_ret_t ret = rcl_publish(&tof_pub, &tof_msg, NULL);
-  if (ret != RCL_RET_OK)
+  // Publish with error handling - only if connected
+  if (connection_state == AGENT_AVAILABLE)
   {
-    // Serial.print("ToF publish failed: ");
-    // Serial.println(ret);
-    return; // Exit early on failure
+    rcl_ret_t ret = rcl_publish(&tof_pub, &tof_msg, NULL);
+    if (ret != RCL_RET_OK)
+    {
+      // Serial.print("ToF publish failed: ");
+      // Serial.println(ret);
+      return; // Exit early on failure
+    }
   }
 
   // Serial.print("ToF distance: ");
@@ -775,28 +790,68 @@ void pwm_scale_callback(const void *msgin)
   // Serial.println(scale_motor_pwm);
 }
 
-// FreeRTOS Main Task - handles ROS executor only
+// FreeRTOS Main Task - handles ROS executor and agent connection
 void mainTask(void *pvParameters)
 {
   // Serial.println("Main Task started");
 
   static unsigned long last_sync_time = 0;
   const unsigned long sync_interval = 10000; // Sync every 10 seconds
+  static unsigned long last_reconnection_attempt = 0;
+  const unsigned long reconnection_attempt_interval = 2000; // Attempt reconnection every 2 seconds
 
   while (true)
   {
-    // Periodic time synchronization
-    if (millis() - last_sync_time > sync_interval)
+    // State machine for connection management
+    switch (connection_state)
     {
-      synchronize_time();
-      last_sync_time = millis();
-    }
+    case WAITING_AGENT:
+      // Check if agent is available
+      if (millis() - last_reconnection_attempt > reconnection_attempt_interval)
+      {
+        // Serial.println("Pinging agent...");
+        rmw_ret_t ping_result = rmw_uros_ping_agent(ping_timeout_ms, ping_attempts);
+        if (ping_result == RMW_RET_OK)
+        {
+          // Serial.println("Agent available - creating entities");
+          create_entities();
+          synchronize_time(); // Try to synchronize time immediately when connected
+          last_sync_time = millis();
+          connection_state = AGENT_AVAILABLE;
+        }
+        last_reconnection_attempt = millis();
+      }
+      break;
 
-    // Only proceed with ROS operations if time is synchronized
-    if (time_sync_status)
-    {
-      // Handle ROS executor
-      rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+    case AGENT_AVAILABLE:
+      // Periodic time synchronization
+      if (millis() - last_sync_time > sync_interval)
+      {
+        synchronize_time();
+        last_sync_time = millis();
+      }
+
+      // Check if agent is still available
+      if (rmw_uros_ping_agent(ping_timeout_ms, ping_attempts) != RMW_RET_OK)
+      {
+        // Serial.println("Agent lost - destroying entities");
+        connection_state = AGENT_DISCONNECTED;
+        time_sync_status = false; // Reset time sync status
+      }
+      else if (time_sync_status)
+      {
+        // Handle ROS executor only if time is synchronized
+        // Reduced timeout to minimize blocking servo movement
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5));
+      }
+      break;
+
+    case AGENT_DISCONNECTED:
+      // Serial.println("Agent disconnected - cleaning up");
+      destroy_entities();
+      connection_state = WAITING_AGENT;
+      last_reconnection_attempt = millis(); // Reset reconnection timer
+      break;
     }
 
     vTaskDelay(1); // Small delay like in example
@@ -813,8 +868,8 @@ void tofTask(void *pvParameters)
 
   while (true)
   {
-    // Only publish if time is synchronized
-    if (time_sync_status)
+    // Only publish if agent is connected and time is synchronized
+    if (connection_state == AGENT_AVAILABLE && time_sync_status)
     {
       // Publish ToF data at 20Hz using millis() timing
       if (millis() - last_tof_publish > tof_publish_interval)
@@ -828,3 +883,145 @@ void tofTask(void *pvParameters)
   }
 }
 
+// Create ROS2 entities when agent becomes available
+void create_entities()
+{
+  // Create init_options
+  // Serial.println("Initializing ROS support...");
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // Create node
+  // Serial.println("Creating ROS node...");
+  RCCHECK(rclc_node_init_default(&node, "rio_mini", "", &support));
+
+  // Create subscriptions
+  // Serial.println("Creating subscriptions...");
+
+  // Serial.println("Creating cmd_vel subscription...");
+  RCCHECK(rclc_subscription_init_default(
+      &cmd_vel_sub,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, TwistStamped),
+      "cmd_vel"));
+
+  // Serial.println("Creating head_pitch subscription...");
+  RCCHECK(rclc_subscription_init_default(
+      &head_pitch_sub,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+      "head_pitch"));
+
+  // Serial.println("Creating led subscription...");
+  RCCHECK(rclc_subscription_init_default(
+      &led_sub,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, ColorRGBA),
+      "led"));
+
+  // Serial.println("Creating pwm_scale subscription...");
+  RCCHECK(rclc_subscription_init_default(
+      &pwm_scale_sub,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+      "pwm_scale"));
+
+  // Create publisher
+  // Serial.println("Creating publisher...");
+  RCCHECK(rclc_publisher_init_best_effort(
+      &tof_pub,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Range),
+      "tof"));
+
+  // Serial.println("Initializing executor...");
+  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
+
+  // Add subscriptions to executor
+  // Serial.println("Adding subscriptions to executor...");
+  RCCHECK(rclc_executor_add_subscription(&executor, &cmd_vel_sub, &twist_msg, &cmd_vel_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &head_pitch_sub, &head_pitch_msg, &head_pitch_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &led_sub, &led_msg, &led_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &pwm_scale_sub, &pwm_scale_msg, &pwm_scale_callback, ON_NEW_DATA));
+
+  // Serial.println("ROS entities created successfully");
+}
+
+// Destroy ROS2 entities when agent connection is lost
+void destroy_entities()
+{
+  // Serial.println("Destroying ROS entities...");
+
+  // Remove subscriptions from executor
+  RCSOFTCHECK(rclc_executor_remove_subscription(&executor, &cmd_vel_sub));
+  RCSOFTCHECK(rclc_executor_remove_subscription(&executor, &head_pitch_sub));
+  RCSOFTCHECK(rclc_executor_remove_subscription(&executor, &led_sub));
+  RCSOFTCHECK(rclc_executor_remove_subscription(&executor, &pwm_scale_sub));
+
+  // Destroy subscriptions
+  RCSOFTCHECK(rcl_subscription_fini(&cmd_vel_sub, &node));
+  RCSOFTCHECK(rcl_subscription_fini(&head_pitch_sub, &node));
+  RCSOFTCHECK(rcl_subscription_fini(&led_sub, &node));
+  RCSOFTCHECK(rcl_subscription_fini(&pwm_scale_sub, &node));
+
+  // Destroy publisher
+  RCSOFTCHECK(rcl_publisher_fini(&tof_pub, &node));
+
+  // Destroy executor
+  RCSOFTCHECK(rclc_executor_fini(&executor));
+
+  // Destroy node
+  RCSOFTCHECK(rcl_node_fini(&node));
+
+  // Destroy support
+  RCSOFTCHECK(rclc_support_fini(&support));
+
+  // Serial.println("ROS entities destroyed");
+}
+
+// FreeRTOS Servo Task - handles smooth servo movement
+void servoTask(void *pvParameters)
+{
+  // Serial.println("Servo Task started on Core 0");
+
+  while (true)
+  {
+    // If servo is moving, calculate position based on elapsed time
+    if (servo_is_moving)
+    {
+      unsigned long current_time = millis();
+      unsigned long elapsed_time = current_time - servo_movement_start_time;
+
+      // If we've reached or exceeded the movement duration, set to target position
+      if (elapsed_time >= SERVO_MOVEMENT_DURATION_MS)
+      {
+        // Movement complete
+        servo.write(servo_target_position);
+        servo_current_position = servo_target_position;
+        servo_is_moving = false;
+        // Serial.println("Servo movement complete");
+      }
+      else
+      {
+        // Calculate intermediate position based on elapsed time
+        float progress = (float)elapsed_time / SERVO_MOVEMENT_DURATION_MS;
+
+        // Use smooth easing function for more natural movement
+        // Apply ease-in-out curve: 3t^2 - 2t^3
+        float eased_progress = 3.0 * progress * progress - 2.0 * progress * progress * progress;
+
+        int position_diff = servo_target_position - servo_current_position;
+        int new_position = servo_current_position + (int)(eased_progress * position_diff);
+
+        // Ensure position is within valid range
+        new_position = constrain(new_position, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+
+        // Update servo position
+        servo.write(new_position);
+      }
+    }
+
+    // Very small delay for high-frequency updates (100Hz = 10ms)
+    // This ensures smooth movement even with ROS executor delays
+    vTaskDelay(10); // 100Hz update rate for very smooth movement
+  }
+}
